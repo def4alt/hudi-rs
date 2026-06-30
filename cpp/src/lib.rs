@@ -23,7 +23,7 @@ use cxx::{CxxString, CxxVector};
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::table::ReadOptions;
+use hudi::table::{ReadOptions, Table};
 
 #[cxx::bridge]
 mod ffi {
@@ -57,6 +57,11 @@ mod ffi {
             self: &HudiFileGroupReader,
             file_slice: &HudiFileSlice,
         ) -> Result<*mut ArrowArrayStream>;
+
+        type HudiTable;
+        fn new_table(path: &CxxString) -> Result<Box<HudiTable>>;
+
+        fn read_at(self: &HudiTable, timestamp: &CxxString) -> Result<*mut ArrowArrayStream>;
     }
 }
 
@@ -187,4 +192,51 @@ pub fn new_file_slice_from_file_names(
     Ok(Box::new(HudiFileSlice {
         inner: file_slice.clone(),
     }))
+}
+
+pub struct HudiTable {
+    inner: Table,
+    rt: tokio::runtime::Runtime,
+}
+
+fn new_table(path: &CxxString) -> std::result::Result<Box<HudiTable>, String> {
+    let path = path
+        .to_str()
+        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+
+    let table = rt
+        .block_on(Table::new(path))
+        .map_err(|e| format!("Failed to create table: {e}"))?;
+
+    Ok(Box::new(HudiTable { inner: table, rt }))
+}
+
+impl HudiTable {
+    fn read_at(
+        &self,
+        timestamp: &CxxString,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let timestamp = timestamp
+            .to_str()
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+
+        let opts = ReadOptions::new().with_as_of_timestamp(timestamp);
+
+        let batches = self
+            .rt
+            .block_on(self.inner.read(&opts))
+            .map_err(|e| format!("Failed to read table: {e}"))?;
+
+        if batches.is_empty() {
+            return Err("No data found at the given timestamp".to_string());
+        }
+
+        let schema = batches[0].schema();
+        Ok(create_raw_pointer_for_record_batches(batches, schema))
+    }
 }
