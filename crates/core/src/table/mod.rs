@@ -109,7 +109,8 @@ use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::meta_field::MetaField;
 use crate::schema::resolver::{
-    resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
+    resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema,
+    resolve_data_schema_from_commit_metadata, resolve_schema,
 };
 use crate::statistics::estimator::FileStatsEstimator;
 use crate::table::builder::TableBuilder;
@@ -368,6 +369,29 @@ impl Table {
     /// 3. `hoodie.properties` file's [HudiTableConfig::CreateSchema].
     pub async fn get_schema(&self) -> Result<Schema> {
         self.get_schema_inner(false).await
+    }
+
+    pub async fn get_schema_as_of(&self, timestamp: &str) -> Result<Option<Schema>> {
+        let timestamp = format_timestamp(timestamp, &self.timezone())?;
+
+        let Some(instant) = self
+            .timeline
+            .get_completed_instants_at_or_before(&timestamp)?
+            .into_iter()
+            .next_back()
+        else {
+            return Ok(None);
+        };
+
+        let commit_metadata = self.timeline.get_instant_metadata(&instant).await?;
+
+        let schema = resolve_data_schema_from_commit_metadata(
+            &commit_metadata,
+            self.timeline.storage.clone(),
+        )
+        .await?;
+
+        Ok(Some(schema))
     }
 
     /// Get the latest [arrow_schema::Schema] of the table, with Hudi meta fields (`_hoodie_*`)

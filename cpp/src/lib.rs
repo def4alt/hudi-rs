@@ -62,6 +62,8 @@ mod ffi {
         fn new_table(path: &CxxString) -> Result<Box<HudiTable>>;
 
         fn read_at(self: &HudiTable, timestamp: &CxxString) -> Result<*mut ArrowArrayStream>;
+
+        fn list_snapshots(self: &HudiTable) -> Result<Vec<String>>;
     }
 }
 
@@ -233,10 +235,29 @@ impl HudiTable {
             .map_err(|e| format!("Failed to read table: {e}"))?;
 
         if batches.is_empty() {
-            return Err("No data found at the given timestamp".to_string());
+            let schema = self
+                .rt
+                .block_on(self.inner.get_schema_as_of(timestamp))
+                .map_err(|e| format!("Failed to resolve schema at timestamp: {e}"))?
+                .map(std::sync::Arc::new)
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+
+            return Ok(create_raw_pointer_for_record_batches(batches, schema));
         }
 
         let schema = batches[0].schema();
         Ok(create_raw_pointer_for_record_batches(batches, schema))
+    }
+
+    fn list_snapshots(&self) -> std::result::Result<Vec<String>, String> {
+        let timestamps = self
+            .inner
+            .get_timeline()
+            .completed_commits
+            .iter()
+            .map(|t| t.timestamp.clone())
+            .collect();
+
+        Ok(timestamps)
     }
 }
