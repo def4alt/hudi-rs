@@ -24,6 +24,7 @@ use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::table::{ReadOptions, Table};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cxx::bridge]
 mod ffi {
@@ -64,6 +65,18 @@ mod ffi {
         fn read_at(self: &HudiTable, timestamp: &CxxString) -> Result<*mut ArrowArrayStream>;
 
         fn list_snapshots(self: &HudiTable) -> Result<Vec<String>>;
+
+        fn num_snapshots(self: &HudiTable) -> Result<u32>;
+
+        fn read_at_version(self: &HudiTable, version: u32) -> Result<*mut ArrowArrayStream>;
+
+        fn next_version_candidate(self: &HudiTable) -> Result<VersionCandidate>;
+    }
+
+    struct VersionCandidate {
+        version: u32,
+        request_path: String,
+        commit_path: String,
     }
 }
 
@@ -226,7 +239,13 @@ impl HudiTable {
         let timestamp = timestamp
             .to_str()
             .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+        self.read_at_internal(timestamp)
+    }
 
+    fn read_at_internal(
+        &self,
+        timestamp: &str,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let opts = ReadOptions::new().with_as_of_timestamp(timestamp);
 
         let batches = self
@@ -259,5 +278,41 @@ impl HudiTable {
             .collect();
 
         Ok(timestamps)
+    }
+
+    fn num_snapshots(&self) -> std::result::Result<u32, String> {
+        Ok(self.inner.get_timeline().completed_commits.len() as u32)
+    }
+
+    fn read_at_version(
+        &self,
+        version: u32,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let ts = self
+            .inner
+            .get_timeline()
+            .completed_commits
+            .get(version as usize)
+            .ok_or_else(|| format!("version {} out of range", version))?
+            .timestamp
+            .clone();
+        self.read_at_internal(&ts)
+    }
+
+    fn next_version_candidate(
+        &self,
+    ) -> std::result::Result<ffi::VersionCandidate, String> {
+        let version = self.inner.get_timeline().completed_commits.len() as u32;
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("Failed to get system time: {e}"))?
+            .as_millis();
+        let ts = format!("{:017}", millis);
+
+        Ok(ffi::VersionCandidate {
+            version,
+            request_path: format!(".hoodie/{}.commit.requested", ts),
+            commit_path: format!(".hoodie/{}.commit", ts),
+        })
     }
 }
