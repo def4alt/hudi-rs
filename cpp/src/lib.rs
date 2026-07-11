@@ -24,7 +24,6 @@ use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::table::{ReadOptions, Table};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cxx::bridge]
 mod ffi {
@@ -61,6 +60,11 @@ mod ffi {
 
         type HudiTable;
         fn new_table(path: &CxxString) -> Result<Box<HudiTable>>;
+        fn new_table_with_options(
+            path: &CxxString,
+            options: &CxxVector<CxxString>,
+        ) -> Result<Box<HudiTable>>;
+        unsafe fn free_arrow_array_stream(stream: *mut ArrowArrayStream);
 
         fn read_at(self: &HudiTable, timestamp: &CxxString) -> Result<*mut ArrowArrayStream>;
 
@@ -68,15 +72,19 @@ mod ffi {
 
         fn num_snapshots(self: &HudiTable) -> Result<u32>;
 
-        fn read_at_version(self: &HudiTable, version: u32) -> Result<*mut ArrowArrayStream>;
+        fn read_at_version(
+            self: &HudiTable,
+            version: u32,
+            filter_field: &CxxString,
+            filter_value: &CxxString,
+        ) -> Result<*mut ArrowArrayStream>;
 
-        fn next_version_candidate(self: &HudiTable) -> Result<VersionCandidate>;
+        fn get_file_slices_at_version(self: &HudiTable, version: u32) -> Result<Vec<FileSliceInfo>>;
     }
 
-    struct VersionCandidate {
-        version: u32,
-        request_path: String,
-        commit_path: String,
+    struct FileSliceInfo {
+        base_path: String,
+        log_paths: Vec<String>,
     }
 }
 
@@ -231,6 +239,48 @@ fn new_table(path: &CxxString) -> std::result::Result<Box<HudiTable>, String> {
     Ok(Box::new(HudiTable { inner: table, rt }))
 }
 
+fn new_table_with_options(
+    path: &CxxString,
+    options: &CxxVector<CxxString>,
+) -> std::result::Result<Box<HudiTable>, String> {
+    let path = path
+        .to_str()
+        .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+
+    let mut opt_vec = Vec::new();
+    for opt in options.iter() {
+        let opt_str = opt
+            .to_str()
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+        if let Some((key, value)) = opt_str.split_once('=') {
+            opt_vec.push((key, value));
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
+
+    let table = rt
+        .block_on(Table::new_with_options(path, opt_vec))
+        .map_err(|e| format!("Failed to create table with options: {e}"))?;
+
+    Ok(Box::new(HudiTable { inner: table, rt }))
+}
+
+fn free_arrow_array_stream(stream: *mut ffi::ArrowArrayStream) {
+    if stream.is_null() {
+        return;
+    }
+
+    unsafe {
+        drop(Box::from_raw(
+            stream as *mut arrow_array::ffi_stream::FFI_ArrowArrayStream,
+        ));
+    }
+}
+
 impl HudiTable {
     fn read_at(
         &self,
@@ -287,6 +337,8 @@ impl HudiTable {
     fn read_at_version(
         &self,
         version: u32,
+        filter_field: &CxxString,
+        filter_value: &CxxString,
     ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
         let ts = self
             .inner
@@ -296,23 +348,66 @@ impl HudiTable {
             .ok_or_else(|| format!("version {} out of range", version))?
             .timestamp
             .clone();
-        self.read_at_internal(&ts)
+        let field = filter_field.to_str().unwrap_or("");
+        if field.is_empty() {
+            return self.read_at_internal(&ts);
+        }
+        let value = filter_value
+            .to_str()
+            .map_err(|e| format!("Failed to convert value: {e}"))?;
+        let opts = ReadOptions::new()
+            .with_as_of_timestamp(&ts)
+            .with_filters([(field, "=", value)])
+            .map_err(|e| format!("Failed to set filter: {e}"))?;
+        let batches = self
+            .rt
+            .block_on(self.inner.read(&opts))
+            .map_err(|e| format!("Failed to read table: {e}"))?;
+        if batches.is_empty() {
+            let schema = self
+                .rt
+                .block_on(self.inner.get_schema_as_of(&ts))
+                .map_err(|e| format!("Failed to resolve schema: {e}"))?
+                .map(std::sync::Arc::new)
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+            return Ok(create_raw_pointer_for_record_batches(batches, schema));
+        }
+        let schema = batches[0].schema();
+        Ok(create_raw_pointer_for_record_batches(batches, schema))
     }
 
-    fn next_version_candidate(
+    fn get_file_slices_at_version(
         &self,
-    ) -> std::result::Result<ffi::VersionCandidate, String> {
-        let version = self.inner.get_timeline().completed_commits.len() as u32;
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("Failed to get system time: {e}"))?
-            .as_millis();
-        let ts = format!("{:017}", millis);
-
-        Ok(ffi::VersionCandidate {
-            version,
-            request_path: format!(".hoodie/{}.commit.requested", ts),
-            commit_path: format!(".hoodie/{}.commit", ts),
-        })
+        version: u32,
+    ) -> std::result::Result<Vec<ffi::FileSliceInfo>, String> {
+        let ts = self
+            .inner
+            .get_timeline()
+            .completed_commits
+            .get(version as usize)
+            .ok_or_else(|| format!("version {} out of range", version))?
+            .timestamp
+            .clone();
+        let opts = ReadOptions::new().with_as_of_timestamp(&ts);
+        let slices = self
+            .rt
+            .block_on(self.inner.get_file_slices(&opts))
+            .map_err(|e| format!("Failed to get file slices: {e}"))?;
+        slices
+            .iter()
+            .map(|s| {
+                let log_paths: Vec<String> = s
+                    .log_files
+                    .iter()
+                    .filter_map(|lf| s.log_file_relative_path(lf).ok())
+                    .collect();
+                Ok(ffi::FileSliceInfo {
+                    base_path: s
+                        .base_file_relative_path()
+                        .map_err(|e| format!("Failed to get base path: {e}"))?,
+                    log_paths,
+                })
+            })
+            .collect()
     }
 }
